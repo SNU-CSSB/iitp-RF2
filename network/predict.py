@@ -211,6 +211,11 @@ class Predictor():
         self.device = device
         self.active_fn = nn.Softmax(dim=1)
 
+        if "abag" in model_weights:
+            MODEL_PARAM["for_ab"] = True
+        else:
+            MODEL_PARAM["for_ab"] = False
+
         # define model & load model
         self.model = RoseTTAFoldModule(
             **MODEL_PARAM
@@ -600,6 +605,315 @@ class Predictor():
             lddt=best_lddt[0].detach().cpu().numpy().astype(np.float16),
             pae=best_pae[0].detach().cpu().numpy().astype(np.float16))
 
+    def predict_abag(self, msa, ab_pdb, ag_pdb, epi_s, out_prefix,
+                     n_recycles=4, n_models=1, subcrop=-1, topk=-1, low_vram=False, nseqs=256, nseqs_full=2048,
+                     n_templ=4, msa_mask=0.0, is_training=False, msa_concat_mode="diag", cyclize=False
+                    ):
+        def to_ranges(txt):
+            return [[int(x) for x in r.strip().split('-')]
+                    for r in txt.strip().split(',')]
+
+        self.xyz_converter = self.xyz_converter.cpu()
+        symm="C1"
+
+        ###
+        # Prepare MSA input
+        msa_orig, ins_orig, Ls = parse_a3m(msa)
+        msa_orig = torch.tensor(msa_orig).long()
+        ins_orig = torch.tensor(ins_orig).long()
+        if (msa_orig.shape[0] > nseqs_full):
+            idxs_tokeep = np.random.permutation(msa_orig.shape[0])[:nseqs_full]
+            idxs_tokeep[0] = 0  # keep query
+            msa_orig = msa_orig[idxs_tokeep]
+            ins_orig = ins_orig[idxs_tokeep]
+
+        ###
+        # Prepare structure input
+        L = sum(Ls)
+        L_ab = sum(Ls[:2])
+        L_ag = sum(Ls[2:])
+        xyz_ab, t1d_ab, mask_ab, epi_ab = read_template_pdb_abag(L_ab, ab_pdb, read_bfac=True)
+        xyz_ag, t1d_ag, mask_ag, epi_ag = read_template_pdb_abag(L_ag, ag_pdb, epi_s=epi_s, read_bfac=True)
+
+        def merge_templ(xyz_ab, t1d_ab, xyz_ag, t1d_ag, mask_ab, mask_ag):
+            L_ab = xyz_ab.shape[1]
+            L_ag = xyz_ag.shape[1]
+            blank_xyz_ab = INIT_CRDS.reshape(1,1,27,3).repeat(1,L_ab,1,1) + torch.rand(1,L_ab,1,3)*5.0
+            blank_xyz_ag = INIT_CRDS.reshape(1,1,27,3).repeat(1,L_ag,1,1) + torch.rand(1,L_ag,1,3)*5.0
+            blank_t1d_ab = torch.nn.functional.one_hot(torch.full((1,L_ab,),20).long(), num_classes=22).float()
+            blank_t1d_ag = torch.nn.functional.one_hot(torch.full((1,L_ag,),20).long(), num_classes=22).float()
+            blank_mask_ab = torch.full((1, L_ab, 27), False) 
+            blank_mask_ag = torch.full((1, L_ag, 27), False) 
+
+            xyz_ab_t = torch.cat((xyz_ab, blank_xyz_ag), dim=1)
+            xyz_ag_t = torch.cat((blank_xyz_ab, xyz_ag), dim=1)
+            t1d_ab_t = torch.cat((t1d_ab, blank_t1d_ag), dim=1)
+            t1d_ag_t = torch.cat((blank_t1d_ab, t1d_ag), dim=1)
+            mask_ab_t = torch.cat((mask_ab, blank_mask_ag), dim=1)
+            mask_ag_t = torch.cat((blank_mask_ab, mask_ag), dim=1)
+
+            return torch.cat((xyz_ab_t, xyz_ag_t), dim=0), torch.cat((t1d_ab_t, t1d_ag_t), dim=0), torch.cat((mask_ab_t, mask_ag_t), dim=0)
+        
+        def prepare_init(xyz_ab, xyz_ag, epi_ag):
+            # center xyz
+            xyz_ab = xyz_ab - xyz_ab[:,:,1].mean(dim=1).reshape(1,-1,1,3)
+            xyz_ag = xyz_ag - xyz_ag[:,:,1].mean(dim=1).reshape(1,-1,1,3)
+
+            epitope_center = xyz_ag[:,:,1][epi_ag.bool()].mean(dim=1)
+            xyz_ab = xyz_ab + epitope_center.reshape(1,1,1,3)
+            return torch.cat((xyz_ab, xyz_ag), dim=1), torch.cat((mask_ab, mask_ag), dim=1)
+
+        xyz_t, t1d, mask_t = merge_templ(xyz_ab, t1d_ab, xyz_ag, t1d_ag, mask_ab, mask_ag)
+        xyz_prev, mask_prev = prepare_init(xyz_ab, xyz_ag, mask_ab, mask_ag, epi_ag)
+
+        epi_info = torch.cat((epi_ab, epi_ag), dim=1)
+
+        same_chain = torch.zeros((1,L,L), dtype=torch.bool, device=xyz_t.device)
+        same_chain[:,:L_ab,:L_ab] = True
+        same_chain[:,L_ab:,L_ab:] = True
+
+        # template features
+        xyz_t = xyz_t[:maxtmpl].float().unsqueeze(0)
+        mask_t = mask_t[:maxtmpl].unsqueeze(0)
+        t1d = t1d[:maxtmpl].float().unsqueeze(0)
+
+        seq_tmp = t1d[...,:-1].argmax(dim=-1).reshape(-1,L)
+        alpha, _, alpha_mask, _ = self.xyz_converter.get_torsions(xyz_t.reshape(-1,L,27,3), seq_tmp, mask_in=mask_t.reshape(-1,L,27))
+        alpha_mask = torch.logical_and(alpha_mask, ~torch.isnan(alpha[...,0]))
+
+        alpha[torch.isnan(alpha)] = 0.0
+        alpha = alpha.reshape(1,-1,L,10,2)
+        alpha_mask = alpha_mask.reshape(1,-1,L,10,1)
+        alpha_t = torch.cat((alpha, alpha_mask), dim=-1).reshape(1, -1, L, 3*10)
+
+        ###
+        # pass 3, symmetry
+        
+        symmids,symmRs,symmmeta,symmoffset = symm_subunit_matrix(symm)
+        O = symmids.shape[0]
+        xyz_prev, symmsub = find_symm_subs(xyz_prev[:,:L],symmRs,symmmeta)
+
+        Osub = symmsub.shape[0]
+        mask_t = mask_t.repeat(1,1,Osub,1)
+        alpha_t = alpha_t.repeat(1,1,Osub,1)
+        mask_prev = mask_t[:,0]
+        xyz_t = xyz_t.repeat(1,1,Osub,1,1)
+        t1d = t1d.repeat(1,1,Osub,1)
+
+        # symmetrize msa
+        effL = Osub*L
+        if (Osub>1):
+            msa_orig, ins_orig = merge_a3m_homo(msa_orig, ins_orig, Osub, mode=msa_concat_mode)
+
+        # index
+        idx_pdb = torch.arange(Osub*L)[None,:]
+        chain_idx = torch.arange(Osub*L)[None,:]
+        chain_idx = 2
+        chain_idx[:Ls[0]] = 0
+        chain_idx[Ls[0]:Ls[0]+Ls[1]] = 1
+        chain_idx = chain_idx.long()
+
+        i_start = 0
+        for o_i in range(Osub):
+            for li in Ls:
+                i_stop = i_start + li
+                idx_pdb[:,i_stop:] += 100
+                i_start = i_stop
+
+        mask_t_2d = mask_t[:,:,:,:3].all(dim=-1) # (B, T, L)
+        mask_t_2d = mask_t_2d[:,:,None]*mask_t_2d[:,:,:,None] # (B, T, L, L)
+        mask_t_2d = mask_t_2d.float()*same_chain.float()[:,None] # (ignore inter-chain region)
+
+        if is_training:
+            self.model.train()
+        else:
+            self.model.eval()
+        for i_trial in range(n_models):
+            #if os.path.exists("%s_%02d_init.pdb"%(out_prefix, i_trial)):
+            #    continue
+            torch.cuda.reset_peak_memory_stats()
+            start_time = time.time()
+            self.run_prediction_abag(
+                msa_orig, ins_orig, 
+                t1d, xyz_t, alpha_t, mask_t_2d, 
+                xyz_prev, mask_prev, same_chain, idx_pdb, chain_idx, epi_info,
+                symmids, symmsub, symmRs, symmmeta,  Ls, 
+                n_recycles, nseqs, nseqs_full, subcrop, topk, low_vram, cyclize,
+                "%s_%02d"%(out_prefix, i_trial),
+                msa_mask=msa_mask
+            )
+            runtime = time.time() - start_time
+            vram = torch.cuda.max_memory_allocated() / 1e9
+            print(f"runtime={runtime:.2f} vram={vram:.2f}")
+            torch.cuda.empty_cache()
+
+    def run_prediction_abag(
+        self, msa_orig, ins_orig, 
+        t1d, xyz_t, alpha_t, mask_t, 
+        xyz_prev, mask_prev, same_chain, idx_pdb, chain_idx, epi_info,
+        symmids, symmsub, symmRs, symmmeta, L_s, 
+        n_recycles, nseqs, nseqs_full, subcrop, topk, low_vram, cyclize, out_prefix,
+        msa_mask=0.0,
+    ):
+        self.xyz_converter = self.xyz_converter.to(self.device)
+        self.lddt_bins = self.lddt_bins.to(self.device)
+
+        STRIPE = get_striping_parameters(low_vram)
+
+        with torch.no_grad():
+            msa = msa_orig.long().to(self.device) # (N, L)
+            ins = ins_orig.long().to(self.device)
+
+            print(f"N={msa.shape[0]} L={msa.shape[1]}")
+            N, L = msa.shape[:2]
+            O = symmids.shape[0]
+            Osub = symmsub.shape[0]
+            Lasu = L//Osub
+
+            B = 1
+            #
+            t1d = t1d.to(self.device).half()
+            t2d = xyz_to_t2d(xyz_t, mask_t).half()
+            if not low_vram:
+                t2d = t2d.to(self.device) #.half()
+            idx_pdb = idx_pdb.to(self.device)
+            chain_idx = chain_idx.to(self.device)
+            epi_info = epi_info.to(self.device)
+            xyz_t = xyz_t[:,:,:,1].to(self.device)
+            mask_t = mask_t.to(self.device)
+            alpha_t = alpha_t.to(self.device)
+            xyz_prev = xyz_prev.to(self.device)
+            mask_prev = mask_prev.to(self.device)
+            same_chain = same_chain.to(self.device)
+            symmids = symmids.to(self.device)
+            symmsub = symmsub.to(self.device)
+            symmRs = symmRs.to(self.device)
+
+            subsymms, _ = symmmeta
+            for i in range(len(subsymms)):
+                subsymms[i] = subsymms[i].to(self.device)
+
+            msa_prev=None
+            pair_prev=None
+            state_prev=None
+            mask_recycle = mask_prev[:,:,:3].bool().all(dim=-1)
+            mask_recycle = mask_recycle[:,:,None]*mask_recycle[:,None,:] # (B, L, L)
+            mask_recycle = same_chain.float()*mask_recycle.float()
+
+            best_lddt = torch.tensor([-1.0], device=self.device)
+            best_xyz = None
+            best_logit = None
+            best_pae = None
+
+            for i_cycle in range(n_recycles + 1):
+                seq, msa_seed_orig, msa_seed, msa_extra, mask_msa = MSAFeaturize(
+                    msa, ins, p_mask=msa_mask, params={'MAXLAT': nseqs, 'MAXSEQ': nseqs_full, 'MAXCYCLE': 1})
+
+                seq = seq.unsqueeze(0)
+                msa_seed = msa_seed.unsqueeze(0)
+                msa_extra = msa_extra.unsqueeze(0)
+
+                #fd memory savings
+                msa_seed = msa_seed.half()  # GPU ONLY
+                msa_extra = msa_extra.half()  # GPU ONLY
+
+                xyz_prev_prev = xyz_prev.clone()
+
+                with torch.cuda.amp.autocast(True):
+                    logit_s, _, _, logits_pae, p_bind, xyz_prev, alpha, symmsub, pred_lddt, msa_prev, pair_prev, state_prev = self.model(
+                                                               msa_seed, msa_extra,
+                                                               seq, xyz_prev, 
+                                                               idx_pdb,
+                                                               t1d=t1d, t2d=t2d, xyz_t=xyz_t,
+                                                               alpha_t=alpha_t, mask_t=mask_t,
+                                                               chain_idx=chain_idx,
+                                                               same_chain=same_chain,
+                                                               msa_prev=msa_prev,
+                                                               pair_prev=pair_prev,
+                                                               state_prev=state_prev,
+                                                               p2p_crop=subcrop,
+                                                               topk_crop=topk,
+                                                               mask_recycle=mask_recycle,
+                                                               epitope_info=epi_info,
+                                                               symmids=symmids,
+                                                               symmsub=symmsub,
+                                                               symmRs=symmRs,
+                                                               symmmeta=symmmeta, 
+                                                               striping=STRIPE,
+                                                               nc_cycle=cyclize )
+                    alpha = alpha[-1].to(seq.device)
+                    xyz_prev = xyz_prev[-1].to(seq.device)
+                    _, xyz_prev = self.xyz_converter.compute_all_atom(seq, xyz_prev, alpha)
+
+                mask_recycle=None
+                pair_prev = pair_prev.cpu()
+                msa_prev = msa_prev.cpu()
+
+                pred_lddt = nn.Softmax(dim=1)(pred_lddt.half()) * self.lddt_bins[None,:,None]
+                pred_lddt = pred_lddt.sum(dim=1)
+                logits_pae = pae_unbin(logits_pae.half())
+
+                rmsd,_,_,_ = calc_rmsd(xyz_prev_prev[None].float(), xyz_prev.float(), torch.ones((1,L,27),dtype=torch.bool))
+
+                print (f"recycle {i_cycle} plddt {pred_lddt.mean():.3f} pae {logits_pae.mean():.3f} rmsd {rmsd[0]:.3f}")
+
+                torch.cuda.empty_cache()
+                if pred_lddt.mean() < best_lddt.mean():
+                    pred_lddt, logits_pae, logit_s = None, None, None
+                    continue
+
+                best_xyz = xyz_prev
+                best_logit = logit_s
+                best_lddt = pred_lddt.half().cpu()
+                best_pae = logits_pae.half().cpu()
+                best_logit = [l.half().cpu() for l in logit_s]
+                pred_lddt, logits_pae, logit_s = None, None, None
+
+            # free more memory
+            pair_prev, msa_prev, t2d = None, None, None
+
+            prob_s = list()
+            for logit in best_logit:
+                prob = self.active_fn(logit.to(self.device).float()) # distogram
+                prob_s.append(prob.half().cpu())
+
+        # full complex
+        best_xyz = best_xyz.float().cpu()
+        symmRs = symmRs.cpu()
+        best_xyzfull = torch.zeros( (B,O*Lasu,27,3) )
+        best_xyzfull[:,:Lasu] = best_xyz[:,:Lasu]
+        seq_full = torch.zeros( (B,O*Lasu),dtype=seq.dtype )
+        seq_full[:,:Lasu] = seq[:,:Lasu]
+        best_lddtfull = torch.zeros( (B,O*Lasu) )
+        best_lddtfull[:,:Lasu] = best_lddt[:,:Lasu]
+        for i in range(1,O):
+            best_xyzfull[:,(i*Lasu):((i+1)*Lasu)] = torch.einsum('ij,braj->brai', symmRs[i], best_xyz[:,:Lasu])
+            seq_full[:,(i*Lasu):((i+1)*Lasu)] = seq[:,:Lasu]
+            best_lddtfull[:,(i*Lasu):((i+1)*Lasu)] = best_lddt[:,:Lasu]
+
+        outdata = {}
+
+        # RMS
+        outdata['mean_plddt'] = best_lddt.mean().item()
+        Lstarti = 0
+        for i,li in enumerate(L_s):
+            Lstartj = 0
+            for j,lj in enumerate(L_s):
+                if (j>i):
+                  outdata['pae_chain_'+str(i)+'_'+str(j)] = 0.5 * (
+                      best_pae[:, Lstarti:(Lstarti+li), Lstartj:(Lstartj+lj)].mean() 
+                      + best_pae[:, Lstartj:(Lstartj+lj),Lstarti:(Lstarti+li)].mean()
+                  ).item()
+                Lstartj += lj
+            Lstarti += li
+
+        util.writepdb("%s_pred.pdb"%(out_prefix), best_xyzfull[0], seq_full[0], L_s, bfacts=100*best_lddtfull[0])
+
+        prob_s = [prob.permute(0,2,3,1).detach().cpu().numpy().astype(np.float16) for prob in prob_s]
+        np.savez_compressed("%s.npz"%(out_prefix),
+            dist=prob_s[0].astype(np.float16),
+            lddt=best_lddt[0].detach().cpu().numpy().astype(np.float16),
+            pae=best_pae[0].detach().cpu().numpy().astype(np.float16))
 
 
 if __name__ == "__main__":

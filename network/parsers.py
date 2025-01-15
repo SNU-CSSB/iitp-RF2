@@ -341,9 +341,10 @@ def read_templates(qlen, ffdb, hhr_fn, atab_fn, templ_to_use=[], offset=0, n_tem
     
     return xyz, f1d, mask_t
 
-def read_template_pdb(qlen, templ_fn, align_conf=1.0):
+def read_template_pdb(qlen, templ_fn, align_conf=1.0, read_bfac=False):
     xyz = torch.full((qlen, 27, 3), np.nan).float()
     seq = torch.full((qlen,), 20).long() # all gaps
+    conf = torch.full((qlen,), 0.0).float()
     
     with open(templ_fn) as fp:
         for l in fp:
@@ -360,13 +361,59 @@ def read_template_pdb(qlen, templ_fn, align_conf=1.0):
                     break
             else:
                 continue
+            if read_bfac:
+                conf[idx] = float(l[60:66]) * 0.01 * align_conf
+            else:
+                conf[idx] = align_conf
             seq[idx] = aa_idx
     
     maskaa = torch.logical_not(torch.isnan(xyz[:,:,0])) # (qlen, 3)
-    mask = maskaa[:,:3].all(dim=-1) # (qlen)
-    conf = torch.where(mask, torch.tensor(align_conf).float(), torch.zeros(qlen, dtype=xyz.dtype))
     seq = torch.nn.functional.one_hot(seq, num_classes=21).float()
     t1d = torch.cat((seq, conf[:,None]), -1)
     xyz = xyz.nan_to_num()
 
     return xyz[None], t1d[None], maskaa[None]
+
+def read_template_pdb_abag(qlen, templ_fn, epi_s=[], align_conf=1.0, read_bfac=False):
+    xyz = torch.full((qlen, 27, 3), np.nan).float()
+    seq = torch.full((qlen,), 20).long() # all gaps
+    conf = torch.full((qlen,), 0.0).float()
+    epi_info = torch.full((qlen,), 0).long()
+    
+    with open(templ_fn) as fp:
+        for l in fp:
+            if l[:4] != "ATOM":
+                continue
+            
+            chain, resNo, atom, aa = l[21], int(l[22:26]), l[12:16], l[17:20]
+            aa_idx = util.aa2num[aa] if aa in util.aa2num.keys() else 20
+            #
+            idx = resNo - 1
+            for i_atm, tgtatm in enumerate(util.aa2long[aa_idx][:3]):
+                if tgtatm == atom:
+                    xyz[idx,i_atm,:] = torch.tensor([float(l[30:38]), float(l[38:46]), float(l[46:54])])
+                    break
+            else:
+                continue
+            if read_bfac:
+                conf[idx] = float(l[60:66]) * 0.01 * align_conf
+            else:
+                conf[idx] = align_conf
+            seq[idx] = aa_idx
+
+            if "%s%d"%(chain,resNo) in epi_s:
+                epi_info[idx] = 1
+    
+    maskaa = torch.logical_not(torch.isnan(xyz[:,:,0])) # (qlen, 3)
+    seq = torch.nn.functional.one_hot(seq, num_classes=21).float()
+    t1d = torch.cat((seq, conf[:,None]), -1)
+    xyz = xyz.nan_to_num()
+    epi_info = epi_info.long()
+
+    if len(epi_s) > 0: # extend epitopes
+        xyz_epi = xyz[:,1,:][epi_info.bool()].view(-1, 3) # CA atoms of epitope residues
+        dist = torch.cdist(xyz_epi, xyz[:,1,:])
+        close_residues = (dist <= 5.0).any(dim=0)
+        epi_info[close_residues] = 1
+
+    return xyz[None], t1d[None], maskaa[None], epi_info[None]

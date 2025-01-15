@@ -134,3 +134,25 @@ class BinderNetwork(nn.Module):
         prob = torch.sigmoid( self.classify( logits_inter ) )
         return prob
 
+class EpitopeNetwork(nn.Module):
+    def __init__(self, d_msa,d_state, p_drop=0.1):
+        super(EpitopeNetwork, self).__init__()
+        self.norm_state = nn.LayerNorm(d_state)
+        self.norm_msa = nn.LayerNorm(d_msa)
+        self.proj = nn.Linear(d_msa+d_state, 1)
+
+        self.reset_parameter()
+    
+    def reset_parameter(self):
+        nn.init.zeros_(self.proj.weight)
+        nn.init.zeros_(self.proj.bias)
+    
+    def forward(self, seq, state):
+        B, L = state.shape[:2]
+
+
+        seq = self.norm_msa(seq)
+        state = self.norm_state(state)
+        feat = torch.cat((seq, state), dim=-1)
+        logits = self.proj(feat)
+        return logits.reshape(B, L)

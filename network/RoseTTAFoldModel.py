@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 from Embeddings import MSA_emb, Extra_emb, Templ_emb, Recycling
 from Track_module import IterativeSimulator
-from AuxiliaryPredictor import DistanceNetwork, MaskedTokenNetwork, ExpResolvedNetwork, LDDTNetwork, PAENetwork, BinderNetwork
+from AuxiliaryPredictor import DistanceNetwork, MaskedTokenNetwork, ExpResolvedNetwork, LDDTNetwork, PAENetwork, BinderNetwork, EpitopeNetwork
 from util import INIT_CRDS
 from torch import einsum
 
@@ -13,15 +13,17 @@ class RoseTTAFoldModule(nn.Module):
                  d_msa=256, d_msa_full=64, d_pair=128, d_templ=64,
                  n_head_msa=8, n_head_pair=4, n_head_templ=4,
                  d_hidden=32, d_hidden_templ=64,
-                 p_drop=0.15,
+                 p_drop=0.15, for_ab=False,
                  SE3_param_full={'l0_in_features':32, 'l0_out_features':16, 'num_edge_features':32},
                  SE3_param_topk={'l0_in_features':32, 'l0_out_features':16, 'num_edge_features':32},
                  ):
         super(RoseTTAFoldModule, self).__init__()
         #
+        self.for_ab = for_ab
+
         # Input Embeddings
         d_state = SE3_param_topk['l0_out_features']
-        self.latent_emb = MSA_emb(d_msa=d_msa, d_pair=d_pair, d_state=d_state, p_drop=p_drop)
+        self.latent_emb = MSA_emb(d_msa=d_msa, d_pair=d_pair, d_state=d_state, p_drop=p_drop, for_ab=for_ab)
         self.full_emb = Extra_emb(d_msa=d_msa_full, d_init=25, p_drop=p_drop)
         self.templ_emb = Templ_emb(d_pair=d_pair, d_templ=d_templ, d_state=d_state,
                                    n_head=n_head_templ,
@@ -47,11 +49,15 @@ class RoseTTAFoldModule(nn.Module):
         self.exp_pred = ExpResolvedNetwork(d_msa, d_state)
         self.pae_pred = PAENetwork(d_pair)
         self.bind_pred = BinderNetwork() #fd - expose n_hidden as variable?
+        
+        if self.for_ab:
+            self.epitope_pred = EpitopeNetwork(d_msa, d_state)
 
     #@profile
     def forward(self, msa_latent=None, msa_full=None, seq=None, xyz=None, idx=None,
-                t1d=None, t2d=None, xyz_t=None, alpha_t=None, mask_t=None, same_chain=None,
+                t1d=None, t2d=None, xyz_t=None, alpha_t=None, mask_t=None, chain_idx=None, same_chain=None,
                 msa_prev=None, pair_prev=None, state_prev=None, mask_recycle=None,
+                epitope_info=None,
                 return_raw=False, return_full=False,
                 use_checkpoint=False, p2p_crop=-1, topk_crop=-1, nc_cycle=False, 
                 symmids=None, symmsub=None, symmRs=None, symmmeta=None,
@@ -68,7 +74,7 @@ class RoseTTAFoldModule(nn.Module):
             msa_stripe = -1
         else:
             msa_stripe = striping['msa_emb']
-        msa_latent, pair, state = self.latent_emb(msa_latent, seq, idx, stride=msa_stripe, nc_cycle=nc_cycle)
+        msa_latent, pair, state = self.latent_emb(msa_latent, seq, idx, chain_idx=chain_idx, epi_info=epi_info)
         msa_latent, pair, state = (
           msa_latent.to(dtype), pair.to(dtype), state.to(dtype)
         )
@@ -141,6 +147,9 @@ class RoseTTAFoldModule(nn.Module):
 
         # predict experimentally resolved or not
         logits_exp = self.exp_pred(msa[:,0], state)
+
+        if self.for_ab:
+            logits_epitope = self.epitope_pred(msa[:,0], state)
 
         # get all intermediate bb structures
         xyz = einsum('rblij,blaj->rblai', R, xyz-xyz[:,:,1].unsqueeze(-2)) + T.unsqueeze(-2)

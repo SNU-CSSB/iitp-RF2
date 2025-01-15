@@ -10,61 +10,64 @@ from Track_module import PairStr2Pair
 
 #from pytorch_memlab import LineProfiler, profile
 
-
 # Module contains classes and functions to generate initial embeddings
 class PositionalEncoding2D(nn.Module):
     # Add relative positional encoding to pair features
-    def __init__(self, d_model, minpos=-32, maxpos=32):
+    def __init__(self, d_model, minpos=-32, maxpos=32, minchain=-2, maxchain=2, for_ab=False):
         super(PositionalEncoding2D, self).__init__()
         self.minpos = minpos
         self.maxpos = maxpos
         self.nbin = abs(minpos)+maxpos+1
         self.emb = nn.Embedding(self.nbin, d_model)
         self.d_out = d_model
+        self.for_ab = for_ab
+
+        if self.for_ab:
+            self.minchain = minchain
+            self.maxchain = maxchain
+            self.ncbin = abs(minchain) + maxchain + 1
+            self.emb_chain = nn.Embedding(self.ncbin, d_model)
     
-    def forward(self, idx, stride, nc_cycle=False):
+    def forward(self, idx, chain_idx=None):
         B, L = idx.shape[:2]
 
         bins = torch.arange(self.minpos, self.maxpos, device=idx.device)
+        seqsep = idx[:, None, :] - idx[:, :, None]  # (B, L, L)
 
-        seqsep = torch.full((B,L,L),100, device=idx.device)
-        seqsep[0] = idx[0,None,:] - idx[0,:,None] # (B, L, L)
-        if nc_cycle:
-            seqsep[0] = (seqsep[0] + L//2)%L - L//2
+        ib = torch.bucketize(seqsep, bins).long() # (B, L, L)
+        emb = self.emb(ib) #(B, L, L, d_model)
 
-        # fd reduce memory in inference
-        STRIDE = L
-        if (not self.training and stride>0):
-            STRIDE = stride
-
-        if STRIDE>0 and STRIDE<L:
-            emb = torch.zeros((B,L,L,self.d_out), device=idx.device, dtype=self.emb.weight.dtype)
-            for i in range((L-1)//STRIDE+1):
-                rows = torch.arange(i*STRIDE, min((i+1)*STRIDE, L), device=idx.device)[:,None]
-                for j in range((L-1)//STRIDE+1):
-                    cols = torch.arange(j*STRIDE, min((j+1)*STRIDE, L), device=idx.device)[None,:]
-                    ib = torch.bucketize(seqsep[:,rows,cols], bins).long()
-                    emb[:,rows,cols] = self.emb(ib)
+        if self.for_ab:
+            B, L = chain_idx.shape[:2]
+            bins2 = torch.arange(self.minchain, self.maxchain, device=idx.device)
+            chainsep = chain_idx[:, None, :] - chain_idx[:, :, None]
+            ic = torch.bucketize(chainsep, bins2).long()
+            emb_c = self.emb_chain(ic)
+            
+            return emb + emb_c
         else:
-            ib = torch.bucketize(seqsep, bins).long() # (B, L, L)
-            emb = self.emb(ib) #(B, L, L, d_model)
-
-        return emb
+            return emb
 
 class MSA_emb(nn.Module):
     # Get initial seed MSA embedding
     def __init__(self, d_msa=256, d_pair=128, d_state=32, d_init=22+22+2+2,
-                 minpos=-32, maxpos=32, p_drop=0.1):
+                 minpos=-32, maxpos=32, p_drop=0.1, for_ab=False):
         super(MSA_emb, self).__init__()
         self.emb = nn.Linear(d_init, d_msa) # embedding for general MSA
         self.emb_q = nn.Embedding(22, d_msa) # embedding for query sequence -- used for MSA embedding
         self.emb_left = nn.Embedding(22, d_pair) # embedding for query sequence -- used for pair embedding
         self.emb_right = nn.Embedding(22, d_pair) # embedding for query sequence -- used for pair embedding
         self.emb_state = nn.Embedding(22, d_state)
-        self.pos = PositionalEncoding2D(d_pair, minpos=minpos, maxpos=maxpos)
+        self.pos = PositionalEncoding2D(d_pair, minpos=minpos, maxpos=maxpos, for_ab=for_ab)
 
         self.d_init = d_init
         self.d_msa = d_msa
+
+        self.for_ab = for_ab
+        if self.for_ab:
+            self.emb_left_epi = nn.Embedding(2, d_pair)
+            self.emb_right_epi = nn.Embedding(2, d_pair)
+            self.emb_epitope_info = nn.Embedding(2, d_state)
 
         self.reset_parameter()
     
@@ -77,7 +80,7 @@ class MSA_emb(nn.Module):
 
         nn.init.zeros_(self.emb.bias)
 
-    def forward(self, msa, seq, idx, stride, nc_cycle=None):
+    def forward(self, msa, seq, idx, chain_idx=None, epi_info=None):
         # Inputs:
         #   - msa: Input MSA (B, N, L, d_init)
         #   - seq: Input Sequence (B, L)
@@ -93,16 +96,21 @@ class MSA_emb(nn.Module):
         tmp = self.emb_q(seq).unsqueeze(1) # (B, 1, L, d_model) -- query embedding
         msa = (msa + tmp.expand(-1, N, -1, -1)) # adding query embedding to MSA
 
-        # pair embedding 
-        left = self.emb_left(seq)[:,None] # (B, 1, L, d_pair)
-        right = self.emb_right(seq)[:,:,None] # (B, L, 1, d_pair)
-        pair = (left + right) # (B, L, L, d_pair)
-        pair += self.pos(idx, stride, nc_cycle) # add relative position
+        # pair & state embedding 
+        if self.for_ab:
+            left = self.emb_left(seq)[:, None]  + self.emb_left_epi(epi_info)[:, None] # (B, 1, L, d_pair)
+            right = self.emb_right(seq)[:, :, None]  + self.emb_right_epi(epi_info)[:,:,None] # (B, L, 1, d_pair)
+            pair = (left + right) # (B, L, L, d_pair)
+            pair += self.pos(idx, chain_idx) # add relative position
+            state = self.emb_state(seq) + self.emb_epitope_info(epi_info)
+        else:
+            left = self.emb_left(seq)[:,None] # (B, 1, L, d_pair)
+            right = self.emb_right(seq)[:,:,None] # (B, L, 1, d_pair)
+            pair = (left + right) # (B, L, L, d_pair)
+            pair += self.pos(idx) # add relative position
+            state = self.emb_state(seq) #.repeat(oligo,1,1)
 
-        # state embedding
-        state = self.emb_state(seq) #.repeat(oligo,1,1)
-
-        return msa, pair, state
+        return msa, pair, state.view(B, L, -1)
 
 class Extra_emb(nn.Module):
     # Get initial seed MSA embedding
