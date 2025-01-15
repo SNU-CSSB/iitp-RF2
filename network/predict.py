@@ -654,7 +654,7 @@ class Predictor():
 
             return torch.cat((xyz_ab_t, xyz_ag_t), dim=0), torch.cat((t1d_ab_t, t1d_ag_t), dim=0), torch.cat((mask_ab_t, mask_ag_t), dim=0)
         
-        def prepare_init(xyz_ab, xyz_ag, epi_ag):
+        def prepare_init(xyz_ab, xyz_ag, mask_ab, mask_ag, epi_ag):
             # center xyz
             xyz_ab = xyz_ab - xyz_ab[:,:,1].mean(dim=1).reshape(1,-1,1,3)
             xyz_ag = xyz_ag - xyz_ag[:,:,1].mean(dim=1).reshape(1,-1,1,3)
