@@ -416,8 +416,9 @@ def read_template_pdb_abag(qlen, templ_fn, epi_s=[], align_conf=1.0, read_bfac=F
     if len(epi_s) > 0: # extend epitopes
         xyz_epi = xyz[:,1,:][epi_info.bool()].view(-1, 3) # CA atoms of epitope residues
         dist = torch.cdist(xyz_epi, xyz[:,1,:])
-        close_residues = (dist <= 5.0).any(dim=0)
-        print ("Extended epitope", torch.where(close_residues))
+        close_residues = (dist <= 10.0).any(dim=0)
+        #close_residues = (dist <= 4.0).any(dim=0)
+        print ("Extended epitope", torch.where(close_residues)[0]+1)
         epi_info[close_residues] = 1
 
     return xyz[None], t1d[None], maskaa[None], epi_info[None]
