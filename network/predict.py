@@ -658,7 +658,8 @@ class Predictor():
             # center xyz
             xyz_ab = xyz_ab - xyz_ab[:,:,1].mean(dim=1).reshape(1,-1,1,3)
             xyz_ag = xyz_ag - xyz_ag[:,:,1].mean(dim=1).reshape(1,-1,1,3)
-
+            
+            print (epi_ag.shape, xyz_ag.shape)
             epitope_center = xyz_ag[:,:,1][epi_ag.bool()].mean(dim=1)
             xyz_ab = xyz_ab + epitope_center.reshape(1,1,1,3)
             return torch.cat((xyz_ab, xyz_ag), dim=1), torch.cat((mask_ab, mask_ag), dim=1)
