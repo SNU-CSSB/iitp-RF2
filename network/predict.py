@@ -4,7 +4,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 from torch.utils import data
-from parsers import parse_a3m, read_templates, read_template_pdb, parse_pdb
+from parsers import parse_a3m, read_templates, read_template_pdb, parse_pdb, read_template_pdb_abag
 from RoseTTAFoldModel  import RoseTTAFoldModule
 import util
 from collections import namedtuple
