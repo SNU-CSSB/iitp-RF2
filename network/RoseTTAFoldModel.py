@@ -74,7 +74,7 @@ class RoseTTAFoldModule(nn.Module):
             msa_stripe = -1
         else:
             msa_stripe = striping['msa_emb']
-        msa_latent, pair, state = self.latent_emb(msa_latent, seq, idx, chain_idx=chain_idx, epi_info=epi_info)
+        msa_latent, pair, state = self.latent_emb(msa_latent, seq, idx, chain_idx=chain_idx, epi_info=epitope_info)
         msa_latent, pair, state = (
           msa_latent.to(dtype), pair.to(dtype), state.to(dtype)
         )

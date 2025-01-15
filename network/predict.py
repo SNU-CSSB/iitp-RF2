@@ -659,8 +659,8 @@ class Predictor():
             xyz_ab = xyz_ab - xyz_ab[:,:,1].mean(dim=1).reshape(1,-1,1,3)
             xyz_ag = xyz_ag - xyz_ag[:,:,1].mean(dim=1).reshape(1,-1,1,3)
             
-            print (epi_ag.shape, xyz_ag.shape)
-            epitope_center = xyz_ag[:,:,1][epi_ag.bool()].mean(dim=1)
+            xyz_epi = xyz_ag[:,:,1][epi_ag.bool()]
+            epitope_center = xyz_ag[:,:,1][epi_ag.bool()].mean(dim=0)
             xyz_ab = xyz_ab + epitope_center.reshape(1,1,1,3)
             return torch.cat((xyz_ab, xyz_ag), dim=1), torch.cat((mask_ab, mask_ag), dim=1)
 
@@ -674,9 +674,9 @@ class Predictor():
         same_chain[:,L_ab:,L_ab:] = True
 
         # template features
-        xyz_t = xyz_t[:maxtmpl].float().unsqueeze(0)
-        mask_t = mask_t[:maxtmpl].unsqueeze(0)
-        t1d = t1d[:maxtmpl].float().unsqueeze(0)
+        xyz_t = xyz_t.float().unsqueeze(0)
+        mask_t = mask_t.unsqueeze(0)
+        t1d = t1d.float().unsqueeze(0)
 
         seq_tmp = t1d[...,:-1].argmax(dim=-1).reshape(-1,L)
         alpha, _, alpha_mask, _ = self.xyz_converter.get_torsions(xyz_t.reshape(-1,L,27,3), seq_tmp, mask_in=mask_t.reshape(-1,L,27))
@@ -709,7 +709,7 @@ class Predictor():
         # index
         idx_pdb = torch.arange(Osub*L)[None,:]
         chain_idx = torch.arange(Osub*L)[None,:]
-        chain_idx = 2
+        chain_idx[:,:] = 2
         chain_idx[:Ls[0]] = 0
         chain_idx[Ls[0]:Ls[0]+Ls[1]] = 1
         chain_idx = chain_idx.long()
@@ -756,11 +756,23 @@ class Predictor():
         n_recycles, nseqs, nseqs_full, subcrop, topk, low_vram, cyclize, out_prefix,
         msa_mask=0.0,
     ):
+
+        def update_epi(xyz, L_s):
+            L_ab = sum(L_s[:2])
+            L_ag = sum(L_s[2:])
+            xyz_ab = xyz_prev[:,:L_ab,1]
+            xyz_ag = xyz_prev[:,L_ab:,1]
+            dist = torch.cdist(xyz_ag, xyz_ab)
+            new_epi = (dist <= 12.0).any(dim=2)
+            print ("Updated epitope", torch.where(new_epi[0])+1)
+            return torch.cat((torch.full((xyz.shape[0], L_ab),0, device=new_epi.device).long(), new_epi.long()), dim=1)
+
+            
         self.xyz_converter = self.xyz_converter.to(self.device)
         self.lddt_bins = self.lddt_bins.to(self.device)
 
         STRIPE = get_striping_parameters(low_vram)
-
+        
         with torch.no_grad():
             msa = msa_orig.long().to(self.device) # (N, L)
             ins = ins_orig.long().to(self.device)
@@ -858,6 +870,9 @@ class Predictor():
 
                 print (f"recycle {i_cycle} plddt {pred_lddt.mean():.3f} pae {logits_pae.mean():.3f} rmsd {rmsd[0]:.3f}")
 
+                if logits_pae.mean() < 5.0: # update epitope info
+                    epi_info = update_epi(xyz_prev, L_s)
+
                 torch.cuda.empty_cache()
                 if pred_lddt.mean() < best_lddt.mean():
                     pred_lddt, logits_pae, logit_s = None, None, None
@@ -897,6 +912,7 @@ class Predictor():
         # RMS
         outdata['mean_plddt'] = best_lddt.mean().item()
         Lstarti = 0
+        print ("check L_s", L_s)
         for i,li in enumerate(L_s):
             Lstartj = 0
             for j,lj in enumerate(L_s):
@@ -918,34 +934,46 @@ class Predictor():
 
 
 if __name__ == "__main__":
-    args = get_args()
+#    args = get_args()
+#
+#    if (args.db is not None):
+#        FFDB = args.db
+#        FFindexDB = namedtuple("FFindexDB", "index, data")
+#        ffdb = FFindexDB(read_index(FFDB+'_pdb.ffindex'),
+#                         read_data(FFDB+'_pdb.ffdata'))
+#    else:
+#        ffdb = None
+#
+#    if (torch.cuda.is_available()):
+#        print ("Running on GPU")
+#        pred = Predictor(args.model, torch.device("cuda:0"))
+#    else:
+#        print ("Running on CPU")
+#        pred = Predictor(args.model, torch.device("cpu"))
+#
+    #pred.predict(
+    #    inputs=args.inputs, 
+    #    out_prefix=args.prefix, 
+    #    symm=args.symm, 
+    #    n_recycles=args.n_recycles, 
+    #    n_models=args.n_models, 
+    #    subcrop=args.subcrop, 
+    #    topk=args.topk, 
+    #    low_vram=args.low_vram, 
+    #    nseqs=args.nseqs, 
+    #    nseqs_full=args.nseqs_full, 
+    #    cyclize=args.cyclize,
+    #    ffdb=ffdb)
+   
+    default_model = os.path.dirname(__file__)+"/weights/RF2_abag.pt"
+    pred = Predictor(default_model, torch.device("cuda:0"))
+    epi_s="A43,A78,A111,A132,A162"
+    #epi_s="A43,A112,A135,A137,A161,A162,A163"
+    #epi_s="A42,A43,A44,A46,A47,A78,A79,A80,A111,A112,A113,A114,A132,A133,A134,A135,A136,A137,A159,A160,A161,A162,A163,A164,A165,A166,A167,A168"
+    epi_s = epi_s.split(',')
 
-    if (args.db is not None):
-        FFDB = args.db
-        FFindexDB = namedtuple("FFindexDB", "index, data")
-        ffdb = FFindexDB(read_index(FFDB+'_pdb.ffindex'),
-                         read_data(FFDB+'_pdb.ffdata'))
-    else:
-        ffdb = None
-
-    if (torch.cuda.is_available()):
-        print ("Running on GPU")
-        pred = Predictor(args.model, torch.device("cuda:0"))
-    else:
-        print ("Running on CPU")
-        pred = Predictor(args.model, torch.device("cpu"))
-
-    pred.predict(
-        inputs=args.inputs, 
-        out_prefix=args.prefix, 
-        symm=args.symm, 
-        n_recycles=args.n_recycles, 
-        n_models=args.n_models, 
-        subcrop=args.subcrop, 
-        topk=args.topk, 
-        low_vram=args.low_vram, 
-        nseqs=args.nseqs, 
-        nseqs_full=args.nseqs_full, 
-        cyclize=args.cyclize,
-        ffdb=ffdb)
-
+    pred.predict_abag("msa.a3m", "ab_block.pdb", "ag_block.pdb",
+                      epi_s, "test_epi",
+                     n_recycles=10, n_models=1, subcrop=-1, topk=-1, low_vram=False, nseqs=256, nseqs_full=2048,
+                     n_templ=4, msa_mask=0.0, is_training=False, msa_concat_mode="diag", cyclize=False
+                    )

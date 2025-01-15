@@ -379,16 +379,19 @@ def read_template_pdb_abag(qlen, templ_fn, epi_s=[], align_conf=1.0, read_bfac=F
     seq = torch.full((qlen,), 20).long() # all gaps
     conf = torch.full((qlen,), 0.0).float()
     epi_info = torch.full((qlen,), 0).long()
-    
+
+    offset = 0
     with open(templ_fn) as fp:
         for l in fp:
+            if l.startswith("TER"):
+                offset = idx + 1
             if l[:4] != "ATOM":
                 continue
             
             chain, resNo, atom, aa = l[21], int(l[22:26]), l[12:16], l[17:20]
             aa_idx = util.aa2num[aa] if aa in util.aa2num.keys() else 20
             #
-            idx = resNo - 1
+            idx = offset + resNo - 1
             for i_atm, tgtatm in enumerate(util.aa2long[aa_idx][:3]):
                 if tgtatm == atom:
                     xyz[idx,i_atm,:] = torch.tensor([float(l[30:38]), float(l[38:46]), float(l[46:54])])
@@ -414,6 +417,7 @@ def read_template_pdb_abag(qlen, templ_fn, epi_s=[], align_conf=1.0, read_bfac=F
         xyz_epi = xyz[:,1,:][epi_info.bool()].view(-1, 3) # CA atoms of epitope residues
         dist = torch.cdist(xyz_epi, xyz[:,1,:])
         close_residues = (dist <= 5.0).any(dim=0)
+        print ("Extended epitope", torch.where(close_residues))
         epi_info[close_residues] = 1
 
     return xyz[None], t1d[None], maskaa[None], epi_info[None]
