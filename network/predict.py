@@ -764,7 +764,7 @@ class Predictor():
             xyz_ag = xyz_prev[:,L_ab:,4]
             dist = torch.cdist(xyz_ag, xyz_ab)
             new_epi = (dist <= 10.0).any(dim=2)
-            print ("Updated epitope", torch.where(new_epi[0])[0]+1)
+            print ("Updated epitope:", ",".join(["%d"%ires for ires in (torch.where(new_epi[0])[0]+1).tolist()]))
             return torch.cat((torch.full((xyz.shape[0], L_ab),0, device=new_epi.device).long(), new_epi.long()), dim=1)
 
             
@@ -912,7 +912,6 @@ class Predictor():
         # RMS
         outdata['mean_plddt'] = best_lddt.mean().item()
         Lstarti = 0
-        print ("check L_s", L_s)
         for i,li in enumerate(L_s):
             Lstartj = 0
             for j,lj in enumerate(L_s):
@@ -934,46 +933,46 @@ class Predictor():
 
 
 if __name__ == "__main__":
-    args = get_args()
+    #args = get_args()
 
-    if (args.db is not None):
-        FFDB = args.db
-        FFindexDB = namedtuple("FFindexDB", "index, data")
-        ffdb = FFindexDB(read_index(FFDB+'_pdb.ffindex'),
-                         read_data(FFDB+'_pdb.ffdata'))
-    else:
-        ffdb = None
+    #if (args.db is not None):
+    #    FFDB = args.db
+    #    FFindexDB = namedtuple("FFindexDB", "index, data")
+    #    ffdb = FFindexDB(read_index(FFDB+'_pdb.ffindex'),
+    #                     read_data(FFDB+'_pdb.ffdata'))
+    #else:
+    #    ffdb = None
 
-    if (torch.cuda.is_available()):
-        print ("Running on GPU")
-        pred = Predictor(args.model, torch.device("cuda:0"))
-    else:
-        print ("Running on CPU")
-        pred = Predictor(args.model, torch.device("cpu"))
+    #if (torch.cuda.is_available()):
+    #    print ("Running on GPU")
+    #    pred = Predictor(args.model, torch.device("cuda:0"))
+    #else:
+    #    print ("Running on CPU")
+    #    pred = Predictor(args.model, torch.device("cpu"))
 
-    pred.predict(
-        inputs=args.inputs, 
-        out_prefix=args.prefix, 
-        symm=args.symm, 
-        n_recycles=args.n_recycles, 
-        n_models=args.n_models, 
-        subcrop=args.subcrop, 
-        topk=args.topk, 
-        low_vram=args.low_vram, 
-        nseqs=args.nseqs, 
-        nseqs_full=args.nseqs_full, 
-        cyclize=args.cyclize,
-        ffdb=ffdb)
+    #pred.predict(
+    #    inputs=args.inputs, 
+    #    out_prefix=args.prefix, 
+    #    symm=args.symm, 
+    #    n_recycles=args.n_recycles, 
+    #    n_models=args.n_models, 
+    #    subcrop=args.subcrop, 
+    #    topk=args.topk, 
+    #    low_vram=args.low_vram, 
+    #    nseqs=args.nseqs, 
+    #    nseqs_full=args.nseqs_full, 
+    #    cyclize=args.cyclize,
+    #    ffdb=ffdb)
    
-    #default_model = os.path.dirname(__file__)+"/weights/RF2_abag.pt"
-    #pred = Predictor(default_model, torch.device("cuda:0"))
-    #epi_s="A78,A111,A132,A162"
-    ##epi_s="A43,A112,A135,A137,A161,A162,A163"
-    ##epi_s="A42,A43,A44,A46,A47,A78,A79,A80,A111,A112,A113,A114,A132,A133,A134,A135,A136,A137,A159,A160,A161,A162,A163,A164,A165,A166,A167,A168"
-    #epi_s = epi_s.split(',')
+    default_model = os.path.dirname(__file__)+"/weights/RF2_abag.pt"
+    pred = Predictor(default_model, torch.device("cuda:0"))
+    epi_s="A78,A111,A132,A162"
+    #epi_s="A43,A112,A135,A137,A161,A162,A163"
+    #epi_s="A42,A43,A44,A46,A47,A78,A79,A80,A111,A112,A113,A114,A132,A133,A134,A135,A136,A137,A159,A160,A161,A162,A163,A164,A165,A166,A167,A168"
+    epi_s = epi_s.split(',')
 
-    #pred.predict_abag("msa.a3m", "ab_block.pdb", "ag_block.pdb",
-    #                  epi_s, "test_epi",
-    #                 n_recycles=10, n_models=1, subcrop=-1, topk=-1, low_vram=False, nseqs=256, nseqs_full=2048,
-    #                 n_templ=4, msa_mask=0.0, is_training=False, msa_concat_mode="diag", cyclize=False
-    #                )
+    pred.predict_abag("msa.a3m", "ab_block.pdb", "ag_block.pdb",
+                      epi_s, "test_epi",
+                     n_recycles=10, n_models=1, subcrop=-1, topk=-1, low_vram=False, nseqs=256, nseqs_full=2048,
+                     n_templ=4, msa_mask=0.0, is_training=False, msa_concat_mode="diag", cyclize=False
+                    )
